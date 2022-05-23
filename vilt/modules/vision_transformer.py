@@ -401,11 +401,12 @@ class PatchEmbed(nn.Module):
             bias=False if no_patch_embed_bias else True,
         )
 
-    def forward(self, x):
-        B, C, H, W = x.shape
+    def forward(self, img):  # img(batch_size, channels, height, width)
+        B, C, H, W = img.shape
         # FIXME look at relaxing size constraints
-        x = self.proj(x)
-        return x
+        # patches(batch_size, emd_size, n_patches, n_patches)
+        patches = self.proj(img)
+        return patches
 
 
 class VisionTransformer(nn.Module):
@@ -554,21 +555,33 @@ class VisionTransformer(nn.Module):
 
         return feats, labels
 
-    def visual_embed(self, _x, max_image_len=200, mask_it=False):
+    def visual_embed(self, _x, max_image_len=200, mask_it=False):  # _x(batch_size, n_channels, height, width)
         _, _, ph, pw = self.patch_embed.proj.weight.shape
-
+        # x(batch_size, emd_size, n_patches, n_patches)
         x = self.patch_embed(_x)
+        # x_mask(batch_size, 1, height, width), pixels with 0 for all channels is masked.
         x_mask = (_x.sum(dim=1) != 0).float()[:, None, :, :]
+        # x_mask(batch_size, 1, n_height_tokens, n_width_tokens)down samples the pixel masks into token masks.
         x_mask = F.interpolate(x_mask, size=(x.shape[2], x.shape[3])).long()
+        # x_mask[:, 0].sum(dim=1)(batch_size, width) each value represents count of unmasked values vertically.
+        # x_mask[:, 0].sum(dim=1)[:, 0] is the first count for all batches.
         x_h = x_mask[:, 0].sum(dim=1)[:, 0]
+        # x_mask[:, 0].sum(dim=1)(batch_size, height) each value represents count of unmasked values horizontally.
+        # x_mask[:, 0].sum(dim=2)[:, 0] is the first count for all batches.
         x_w = x_mask[:, 0].sum(dim=2)[:, 0]
 
         B, C, H, W = x.shape
+        # spatial_pos(1, emd_size, n_valued_patches, n_valued_patches) to represents positional embeddings for patches.
+        # self.pos_embed[:, 1:, :](1, n_position-1, emd_size)
+        #   ->.transpose(1, 2)(1, emd_size, n_position-1)
+        #   ->.view(...)(1, emd_size, n_valued_patches, n_valued_patches)
         spatial_pos = (
             self.pos_embed[:, 1:, :]
             .transpose(1, 2)
             .view(1, C, self.patch_dim, self.patch_dim)
         )
+        # pos_embed(batch_size, emd_size, n_height_patches, n_width_patches) represents position embeddings.
+        # we replicate the position embedding #batch_size times and pad with 0.
         pos_embed = torch.cat(
             [
                 F.pad(
@@ -581,9 +594,16 @@ class VisionTransformer(nn.Module):
             ],
             dim=0,
         )
-
+        # pos_embed(batch_size, n_patches, emd_size)
         pos_embed = pos_embed.flatten(2).transpose(1, 2)
+        # x(batch_size, n_patches, emd_size)
         x = x.flatten(2).transpose(1, 2)
+        # patch_index(batch_size, n_patches, 2). Each (n_patches, 2) contains 2d coordinates for all patches.
+        # e.g., [[0,0], [0, 1] ... [17, 17]]
+        # torch.stack(torch.meshgrid(...))(n_height_patches, n_width_patches, 2) generate 2d coordinates.
+        #   -> )[None, None, :, :, :]  # (1, 1, n_height_patches, n_width_patches, 2)
+        #   ->.expand(...)(batch_size, 1, n_height_patches, n_width_patches, 2)
+        #   ->.flatten(1, 3) # flatten from dim=1 to dim=3
         patch_index = (
             torch.stack(
                 torch.meshgrid(
@@ -594,6 +614,7 @@ class VisionTransformer(nn.Module):
             .expand(x_mask.shape[0], x_mask.shape[1], -1, -1, -1)
             .flatten(1, 3)
         )
+        # x_mask(batch_size, n_patches)
         x_mask = x_mask.flatten(1)
 
         if mask_it:
@@ -613,25 +634,35 @@ class VisionTransformer(nn.Module):
         else:
             eff = x_h * x_w
             max_image_len = min(eff.max(), max_image_len)
-
+        # valid_idx(n_not_masked_tokens, 2(batch_i, patch_i))
         valid_idx = x_mask.nonzero(as_tuple=False)
+        # non_valid_idx(n_masked_tokens, 2(batch_i, patch_i))
         non_valid_idx = (1 - x_mask).nonzero(as_tuple=False)
+        # unique_rows contains example indices that are not all masked.
+        # e.g., [0, 1, 2, 3] means all examples in batch contain non-masked patches.
         unique_rows = valid_idx[:, 0].unique()
+        # valid_row_idx: list([n_not_masked_token, 2(batch_0, patch_i)], [n_not_masked_token, 2(batch_1, patch_i)]...)
+        # valid_row_idx contains non_masked tokens one row per example.
         valid_row_idx = [valid_idx[valid_idx[:, 0] == u] for u in unique_rows]
+        # non_valid_row_idx: list([n_masked_token, 2(batch_0, patch_i)], [n_masked_token, 2(batch_1, patch_i)]...)
+        # non_valid_row_idx contains masked tokens one row per example.
         non_valid_row_idx = [
             non_valid_idx[non_valid_idx[:, 0] == u] for u in unique_rows
         ]
-
+        # valid_nums: list(n_not_masked_tokens for example1, n_not_masked_tokens for example2, ...)
         valid_nums = [v.size(0) for v in valid_row_idx]
+        # non_valid_nums: list(n_masked_tokens for example1, n_masked_tokens for example2, ...)
         non_valid_nums = [v.size(0) for v in non_valid_row_idx]
+        # pad_nums: list(n_padded_tokens for example1, n_padded_tokens for example2, ...)
         pad_nums = [max_image_len - v for v in valid_nums]
-
+        # select: list([n_tokens, 2(batch_0, patch_i)], [n_tokens, 2(batch_1, patch_i)]...)
         select = list()
         for i, (v, nv, p) in enumerate(zip(valid_nums, non_valid_nums, pad_nums)):
-            if p <= 0:
+            if p <= 0:  # no need padding. sample only from not_masked tokens.
                 valid_choice = torch.multinomial(torch.ones(v).float(), max_image_len)
                 select.append(valid_row_idx[i][valid_choice])
-            else:
+            else:  # needs padding. sample #p padding patches from masked tokens.
+                #    And then concat to the end of not_masked tokens.
                 pad_choice = torch.multinomial(
                     torch.ones(nv).float(), p, replacement=True
                 )
