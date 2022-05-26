@@ -37,9 +37,9 @@ class MLMHead(nn.Module):
         if weight is not None:
             self.decoder.weight = weight
 
-    def forward(self, x):
-        x = self.transform(x)
-        x = self.decoder(x) + self.bias
+    def forward(self, x):  # x(batch_size, n_text_tokens, emd_size)
+        x = self.transform(x)  # x(batch_size, n_text_tokens, emd_size)
+        x = self.decoder(x) + self.bias  # x(batch_size, n_text_tokens, voc_size)
         return x
 
 

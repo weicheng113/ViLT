@@ -297,35 +297,49 @@ class Attention(nn.Module):
     ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
+        head_dim = dim // num_heads  # head_dim=64(dim=768 // num_heads=12)
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        # scale = 1/8 = 1/sqrt(head_dim=64). Query and key will divide by 8,
+        # which leads to having more stable gradients.
         self.scale = qk_scale or head_dim ** -0.5
-
+        # self.qkv(nn.Linear(weight(2304=dim*3, dim=768))) contains combined projection matrix
+        # for query, key, value matrices.
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)  # self.proj(Linear(weight(768, 768)))
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, mask=None):
-        B, N, C = x.shape
+    def forward(self, x, mask=None):  # x(batch_size, n_tokens, emd_size)
+        B, N, C = x.shape  # B=batch_size, N=n_tokens, C=emd_size=channels
+        # qkv(3(qkv), batch_size, n_heads, n_tokens, head_dim)
         qkv = (
+            # self.qkv(x)(batch_size, n_tokens, q_emd_size+k_emd_size+v_emd_size)
+            # where x(batch_size, n_tokens, emd_size) dot weight^T(dim=768, dim*3=2304)
+            #   ->.reshape(...)(batch_size, n_tokens, 3(qkv), n_heads, head_dim)
+            #   ->.permute(...)(3(qkv), batch_size, n_heads, n_tokens, head_dim)
             self.qkv(x)
             .reshape(B, N, 3, self.num_heads, C // self.num_heads)
             .permute(2, 0, 3, 1, 4)
         )
-        q, k, v = (
+        q, k, v = (  # q=k=v(batch_size, n_heads, n_tokens, head_dim)
             qkv[0],
             qkv[1],
             qkv[2],
         )  # make torchscript happy (cannot use tensor as tuple)
-
+        # attn(batch_size, n_heads, n_tokens, n_tokens)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         if mask is not None:
             mask = mask.bool()
+            # fill masked raw attn values with -inf, so that when we apply softmax, masked values approach zero.
             attn = attn.masked_fill(~mask[:, None, None, :], float("-inf"))
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
+        # x(batch_size, n_tokens, emd_size=n_heads*head_dim) is the weighted token values.
+        # (attn @ v)(batch_size, n_heads, n_tokens, head_dim) each row is a token representation,
+        #   which is weighted(weighted by attention) combination of all the token values.
+        #   = attn(batch_size, n_heads, n_tokens, n_tokens) @ v(batch_size, n_heads, n_tokens, head_dim)
+        #   -> .transpose(1, 2)(batch_size, n_tokens, n_heads, head_dim)
+        #   -> .reshape(B, N, C)(batch_size, n_tokens, emd_size=n_heads*head_dim)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -368,6 +382,9 @@ class Block(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        # The difference from original transformer is that normalization happens before instead of after each layer.
+        # flow: normalize -> attention -> add(drop_path(_x), skip_connection) -> normalize -> feed forward
+        #   -> add(drop_path(_x), skip_connection)
         _x, attn = self.attn(self.norm1(x), mask=mask)
         x = x + self.drop_path(_x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -392,7 +409,7 @@ class PatchEmbed(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
-
+        # with kernel_size the same as stride, we use Conv2d as a collection of simple linear layers.
         self.proj = nn.Conv2d(
             in_chans,
             embed_dim,
@@ -405,6 +422,9 @@ class PatchEmbed(nn.Module):
         B, C, H, W = img.shape
         # FIXME look at relaxing size constraints
         # patches(batch_size, emd_size, n_patches, n_patches)
+        # There are #n_filters of kernels(channels, kernel_size, kernel_size) convolve through images.
+        # Each image produce a representation(n_filters=emd_size, n_patches, n_patches).
+        # Therefore, a batch of images is represented by patches(batch_size, emd_size, n_patches, n_patches).
         patches = self.proj(img)
         return patches
 
@@ -671,11 +691,16 @@ class VisionTransformer(nn.Module):
                         [valid_row_idx[i], non_valid_row_idx[i][pad_choice]], dim=0,
                     )
                 )
-
+        # select(n_tokens, 2(batch_i, patch_i)) represents selected token indices. It is used to select patches from
+        # the batch.
         select = torch.cat(select, dim=0)
+        # x(batch_size, n_patches, emd_size) represents selected patches.
         x = x[select[:, 0], select[:, 1]].view(B, -1, C)
+        # x_mask(batch_size, n_patches) represents masks for selected patches.
         x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
+        # patch_index(batch_size, n_patches, 2(xy coordinates)) represents xy coordinates of selected patches.
         patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
+        # pos_embed(batch_size, n_patches, emd_size) represents position embeddings of selected patches.
         pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
 
         if mask_it:
@@ -685,18 +710,21 @@ class VisionTransformer(nn.Module):
             label = torch.cat(
                 [torch.full((label.shape[0], 1, 3), -100).to(label), label,], dim=1,
             )
-
+        # cls_token(1, 1, emd_size) -> cls_tokens(batch_size, 1, emd_size)
         cls_tokens = self.cls_token.expand(B, -1, -1)
+        # append a cls_token at the front for every example in batch.
         x = torch.cat((cls_tokens, x), dim=1)
+        # append a cls_token position embedding at the front for every example in batch.
         pos_embed = torch.cat(
             (self.pos_embed[:, 0, :][:, None, :].expand(B, -1, -1), pos_embed), dim=1
         )
+        # add token_embedding + token_positional_embedding
         x = x + pos_embed
         x = self.pos_drop(x)
 
         if self.add_norm_before_transformer:
             x = self.pre_norm(x)
-
+        # append non_mask for cls_token at the front for every example in batch.
         x_mask = torch.cat([torch.ones(x_mask.shape[0], 1).to(x_mask), x_mask], dim=1)
 
         if mask_it:

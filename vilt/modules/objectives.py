@@ -13,14 +13,16 @@ from einops import rearrange
 from vilt.modules.dist_utils import all_gather
 
 
-def cost_matrix_cosine(x, y, eps=1e-5):
+def cost_matrix_cosine(x, y, eps=1e-5):  # x(batch_size, n_text_tokens, emd_size), y(batch_size, n_img_tokens, emd_size)
     """Compute cosine distnace across every pairs of x, y (batched)
     [B, L_x, D] [B, L_y, D] -> [B, Lx, Ly]"""
     assert x.dim() == y.dim()
     assert x.size(0) == y.size(0)
     assert x.size(2) == y.size(2)
-    x_norm = F.normalize(x, p=2, dim=-1, eps=eps)
-    y_norm = F.normalize(y, p=2, dim=-1, eps=eps)
+    x_norm = F.normalize(x, p=2, dim=-1, eps=eps)  # calculate unit vectors for text tokens.
+    y_norm = F.normalize(y, p=2, dim=-1, eps=eps)  # calculate unit vectors for image tokens.
+    # cosine_sim(batch_size, n_text_tokens, n_img_tokens) represents pairwise cosine similarity
+    # between text vectors and image vectors.
     cosine_sim = x_norm.matmul(y_norm.transpose(1, 2))
     cosine_dist = 1 - cosine_sim
     return cosine_dist
@@ -38,6 +40,12 @@ def trace(x):
 @torch.no_grad()
 def ipot(C, x_len, x_pad, y_len, y_pad, joint_pad, beta, iteration, k):
     """ [B, M, N], [B], [B, M], [B], [B, N], [B, M, N]"""
+    # C=cost(batch_size, n_text_tokens, n_img_tokens)
+    # x_len=text_token_len(batch_size)
+    # x_pad=text_token_pad(batch_size, n_text_tokens)
+    # y_len=img_token_len(batch_size)
+    # y_pad=img_token_pad(batch_size, n_img_tokens)
+    # joint_pad(batch_size, n_text_tokens, n_img_tokens) pair-wise joint of text paddings and image paddings.
     b, m, n = C.size()
     sigma = torch.ones(b, m, dtype=C.dtype, device=C.device) / x_len.unsqueeze(1)
     T = torch.ones(b, n, m, dtype=C.dtype, device=C.device)
@@ -67,21 +75,30 @@ def ipot(C, x_len, x_pad, y_len, y_pad, joint_pad, beta, iteration, k):
     T.masked_fill_(joint_pad, 0)
     return T
 
-
+# NOTE: run in fp32 for stability
+# from the paper https://arxiv.org/abs/1909.11740
+# https://github.com/ChenRocks/UNITER/blob/master/model/ot.py
 def optimal_transport_dist(
     txt_emb, img_emb, txt_pad, img_pad, beta=0.5, iteration=50, k=1
 ):
     """ [B, M, D], [B, N, D], [B, M], [B, N]"""
+
+    # cost(batch_size, n_text_tokens, n_img_tokens) represents cosine distance/cost between text and image pairs.
     cost = cost_matrix_cosine(txt_emb, img_emb)
-    # mask the padded inputs
+    # joint_pad(batch_size, n_text_tokens, n_img_tokens) contains indicators
+    # if a token is padded either by text or by image.
     joint_pad = txt_pad.unsqueeze(-1) | img_pad.unsqueeze(-2)
-    cost.masked_fill_(joint_pad, 0)
-
-    txt_len = (txt_pad.size(1) - txt_pad.sum(dim=1, keepdim=False)).to(dtype=cost.dtype)
-    img_len = (img_pad.size(1) - img_pad.sum(dim=1, keepdim=False)).to(dtype=cost.dtype)
-
+    cost.masked_fill_(joint_pad, 0)  # erase the cost for padded tokens.
+    # txt_len(n_examples) example text token lengths.
+    txt_len = (txt_pad.size(1) - txt_pad.sum(dim=1, keepdim=False)).to(
+        dtype=cost.dtype
+    )
+    # img_len(n_examples) example image token lengths.
+    img_len = (img_pad.size(1) - img_pad.sum(dim=1, keepdim=False)).to(
+        dtype=cost.dtype
+    )
     T = ipot(
-        cost.detach(), txt_len, txt_pad, img_len, img_pad, joint_pad, beta, iteration, k
+        cost.detach(), txt_len, txt_pad, img_len, img_pad, joint_pad, 0.5, 50, 1
     )
     distance = trace(cost.matmul(T.detach()))
     return distance
@@ -199,13 +216,14 @@ def compute_mpfr(pl_module, batch):
 
 
 def compute_itm_wpa(pl_module, batch):
-    pos_len = len(batch["text"]) // 2
-    neg_len = len(batch["text"]) - pos_len
+    pos_len = len(batch["text"]) // 2  # positive samples
+    neg_len = len(batch["text"]) - pos_len  # negative samples
     itm_labels = torch.cat([torch.ones(pos_len), torch.zeros(neg_len)]).to(
         pl_module.device
     )
+    # itm_labels(n_samples) is positive and negative sample labels.
     itm_labels = itm_labels[torch.randperm(itm_labels.size(0))]
-
+    # itm_images(list(batch_size, n_channels, height, width)) contains true and false images based on itm_labels.
     itm_images = [
         torch.stack(
             [
@@ -213,7 +231,7 @@ def compute_itm_wpa(pl_module, batch):
                 for i, (ti, fi) in enumerate(zip(bti, bfi))
             ]
         )
-        for bti, bfi in zip(batch["image"], batch["false_image_0"])
+        for bti, bfi in zip(batch["image"], batch["false_image_0"])  # bti - batch true image; bfi - batch false image.
     ]
 
     batch = {k: v for k, v in batch.items()}
@@ -221,24 +239,31 @@ def compute_itm_wpa(pl_module, batch):
 
     infer = pl_module.infer(batch, mask_text=False, mask_image=False)
 
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.cuda.amp.autocast(enabled=False):  # amp is torch Automatic Mixed Precision.
         txt_emb, img_emb = infer["text_feats"], infer["image_feats"]
         txt_mask, img_mask = infer["text_masks"].bool(), infer["image_masks"].bool()
         for i, _len in enumerate(txt_mask.sum(dim=1)):
-            txt_mask[i, _len - 1] = False
+            txt_mask[i, _len - 1] = False  # set last sep token to be masked.
+        # txt_mask(batch_size, n_text_tokens) and img_mask(batch_size, n_img_tokens)
+        # set first cls token of txt_mask/img_mask to be masked.
         txt_mask[:, 0] = False
         img_mask[:, 0] = False
         if "deit" in pl_module.hparams.config["vit"]:
             img_mask[:, 1] = False
+        # txt_pad(batch_size, n_text_tokens) contains indicators for padded tokens, which is opposite masked.
+        # img_pad(batch_size, n_img_tokens) contains indicators for padded tokens, which is opposite masked.
         txt_pad, img_pad = ~txt_mask, ~img_mask
-
+        # cost(batch_size, n_text_tokens, n_img_tokens) represents cosine distance/cost between text and image pairs.
         cost = cost_matrix_cosine(txt_emb.float(), img_emb.float())
+        # joint_pad(batch_size, n_text_tokens, n_img_tokens) contains indicators
+        # if a token is padded either by text or by image.
         joint_pad = txt_pad.unsqueeze(-1) | img_pad.unsqueeze(-2)
-        cost.masked_fill_(joint_pad, 0)
-
+        cost.masked_fill_(joint_pad, 0)  # erase the cost for padded tokens.
+        # txt_len(n_examples) example text token lengths.
         txt_len = (txt_pad.size(1) - txt_pad.sum(dim=1, keepdim=False)).to(
             dtype=cost.dtype
         )
+        # img_len(n_examples) example image token lengths.
         img_len = (img_pad.size(1) - img_pad.sum(dim=1, keepdim=False)).to(
             dtype=cost.dtype
         )
@@ -246,11 +271,18 @@ def compute_itm_wpa(pl_module, batch):
             cost.detach(), txt_len, txt_pad, img_len, img_pad, joint_pad, 0.5, 50, 1
         )
         distance = trace(cost.matmul(T.detach()))
-
+        # distance2(n_examples)
+        distance2 = optimal_transport_dist(txt_emb=txt_emb.float(), img_emb=img_emb.float(),
+                               txt_pad=txt_pad, img_pad=img_pad)
+    # dist_pos(n_positive_examples) represents text and image distance for positive examples;
+    # dist_neg(n_negative_examples) represents text and image distance for negative examples;
     dist_pos = distance.masked_select(itm_labels == 1)
     dist_neg = distance.masked_select(itm_labels == 0)
+    # optimal transports loss(earth mover distance)
+    # ot_loss is average loss.
     ot_loss = (dist_pos.sum() - dist_neg.sum()) / (dist_pos.size(0) + dist_neg.size(0))
-
+    # itm_logits(batch_size, 2)
+    # Simple linear layer to map infer["cls_feats"](batch_size, emd_size) -> itm_logits(batch_size, 2).
     itm_logits = pl_module.itm_score(infer["cls_feats"])
     itm_loss = F.cross_entropy(itm_logits, itm_labels.long())
 

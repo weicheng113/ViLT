@@ -125,26 +125,26 @@ class ViLTransformerSS(pl.LightningModule):
         text_ids = batch[f"text_ids{do_mlm}"]
         text_labels = batch[f"text_labels{do_mlm}"]
         text_masks = batch[f"text_masks"]
-        text_embeds = self.text_embeddings(text_ids)
+        text_embeds = self.text_embeddings(text_ids)  # text_embeds(batch_size, n_tokens, emd_size) represents text embeddings.
 
         if image_embeds is None and image_masks is None:
             img = batch[imgkey][0]
             (
-                image_embeds,
-                image_masks,
-                patch_index,
+                image_embeds,  # image_embeds(batch_size, n_tokens, emd_size) = [image token embeddings] + [image token positional embeddings]
+                image_masks,  # image_masks(batch_size, n_tokens) image token masking indicator, 1 for not masked and 0 for masked.
+                patch_index,  # patch_index(batch_size, n_patches, 2(xy coordinates)) represents xy coordinates of selected patches.
                 image_labels,
             ) = self.transformer.visual_embed(
                 img,
                 max_image_len=self.hparams.config["max_image_len"],
-                mask_it=mask_image,
+                mask_it=mask_image,  # whether to mask image
             )
         else:
             patch_index, image_labels = (
                 None,
                 None,
             )
-
+        # There are two token types, 0 for text and 1 for image. Token type embeddings are added into image and text embeddings.
         text_embeds, image_embeds = (
             text_embeds + self.token_type_embeddings(torch.zeros_like(text_masks)),
             image_embeds
@@ -152,20 +152,25 @@ class ViLTransformerSS(pl.LightningModule):
                 torch.full_like(image_masks, image_token_type_idx)
             ),
         )
-
+        # co_embeds(batch_size, n_text_tokens + n_image_tokens, emd_size) is concatenated text embeddings
+        # and image embeddings.
         co_embeds = torch.cat([text_embeds, image_embeds], dim=1)
+        # co_masks(batch_size, n_text_tokens + n_image_tokens) is concatenated masks of text tokens
+        # and image embeddings.
         co_masks = torch.cat([text_masks, image_masks], dim=1)
 
         x = co_embeds
 
         for i, blk in enumerate(self.transformer.blocks):
             x, _attn = blk(x, mask=co_masks)
-
+        # x(batch_size, n_text_tokens + n_image_tokens, emd_size) is combined feature of text and image.
         x = self.transformer.norm(x)
+        # text_feats(batch_size, n_text_tokens, emd_size), image_feats(batch_size, n_image_tokens, emd_size)
         text_feats, image_feats = (
-            x[:, : text_embeds.shape[1]],
-            x[:, text_embeds.shape[1] :],
+            x[:, :text_embeds.shape[1]],
+            x[:, text_embeds.shape[1]:],
         )
+        # cls_feats(batch_size, emd_size) is the feature representation for classification token.
         cls_feats = self.pooler(x)
 
         ret = {
